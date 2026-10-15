@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import 'mocha';
 import nock from 'nock';
+import net from 'net';
 import sinon from 'sinon';
 import { Action } from '../src/enum/Action';
 import { BondApi } from '../src/BondApi';
@@ -291,6 +292,44 @@ describe('BondApi', () => {
     it('toggleFan sends TurnOff when value is false', async () => {
       stubAction('TurnOff');
       await api.toggleFan(device, false);
+    });
+
+    it('does not retry an action when the Bond returns 5xx, and logs an error', async () => {
+      let calls = 0;
+      nock(`http://${TEST_IP}`)
+        .put('/v2/devices/fan1/actions/TurnOn')
+        .times(5)
+        .reply(() => {
+          calls++;
+          return [500, {}];
+        });
+
+      await api.toggleFan(device, true);
+
+      expect(calls).to.equal(1);
+      const errorCalls = (platform as any).log.error.args as string[][];
+      const requestError = errorCalls.find(args => args[0]?.includes('A request error occurred'));
+      expect(requestError![0]).to.include('PUT');
+      expect(requestError![0]).to.include('/actions/TurnOn');
+      expect(requestError![0]).to.include('[status] 500');
+    });
+
+    it('retries an action a bounded number of times when the connection is refused, warning each time', async function() {
+      this.timeout(10000);
+      // Grab a free local port, then close it so connections are refused.
+      const port = await new Promise<number>(resolve => {
+        const srv = net.createServer().listen(0, '127.0.0.1', () => {
+          const { port } = srv.address() as net.AddressInfo;
+          srv.close(() => resolve(port));
+        });
+      });
+      const refusedApi = new BondApi(platform, TEST_TOKEN, `127.0.0.1:${port}`);
+
+      await refusedApi.toggleFan(device, true);
+
+      expect((platform as any).log.warn.callCount).to.equal(2);
+      const errorCalls = (platform as any).log.error.args as string[][];
+      expect(errorCalls.some(args => args[0]?.includes('ECONNREFUSED'))).to.be.true;
     });
 
     it('setFanSpeed sends SetSpeed with argument', async () => {

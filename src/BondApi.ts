@@ -6,7 +6,7 @@ import { CharacteristicValue } from 'homebridge';
 import { Command, Device } from './interface/Device';
 import { Properties } from './interface/Properties';
 import { Version } from './interface/Version';
-import axios, { AxiosError } from 'axios';
+import axios, { AxiosError, AxiosInstance } from 'axios';
 import axiosRetry from 'axios-retry';
 import FlakeId from 'flake-idgen';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -20,6 +20,10 @@ enum HTTPMethod {
 
 const flakeIdGen = new FlakeId();
 const DEFAULT_MAX_CONCURRENT_REQUESTS = 5;
+const READ_RETRIES = 10;
+// Writes (actions/state changes) must fail fast: HomeKit gives up on a set
+// after ~10s, so retrying for minutes only hides the failure.
+const WRITE_RETRIES = 2;
 
 export class BondApi {
   private bondToken: string;
@@ -30,6 +34,7 @@ export class BondApi {
   private pendingRequests: Array<() => void> = [];
   private queueNextRequest = false;
   private requestQueue: {device: Device, action: Action, body: unknown}[] = [];
+  private http: AxiosInstance;
 
   private formatAxiosError(error: AxiosError): string {
     const status = error.response?.status;
@@ -50,19 +55,27 @@ export class BondApi {
     this.ms_between_actions = ms_between_actions;
     this.maxConcurrentRequests = max_concurrent_requests;
 
-    axiosRetry(axios, {
-      retries: 10,
+    // Use a dedicated client so retry interceptors don't stack on the global
+    // axios instance (one per configured Bond).
+    this.http = axios.create();
+    axiosRetry(this.http, {
+      retries: READ_RETRIES,
       retryDelay: axiosRetry.exponentialDelay,
       shouldResetTimeout: true,
       retryCondition: (error) => {
-        const shouldRetry = axiosRetry.isNetworkOrIdempotentRequestError(error) || error.code === 'ECONNABORTED';
+        const method = error.config?.method?.toLowerCase();
+        const isRead = method === undefined || method === HTTPMethod.GET;
+        // Reads are safe to retry on anything transient. Writes are only retried
+        // when the request never reached the Bond (connection refused/reset);
+        // a 5xx or timeout means the Bond received it, so report it instead.
+        const shouldRetry = isRead
+          ? axiosRetry.isNetworkOrIdempotentRequestError(error) || error.code === 'ECONNABORTED'
+          : axiosRetry.isNetworkError(error);
 
-        this.platform.log.debug(`Retrying: ${shouldRetry ? 'YES' : 'NO'}`, {
-          url: error.config?.url,
-          method: error.config?.method,
-          errorCode: error.code,
-          responseStatus: error.response?.status,
-        });
+        if (shouldRetry) {
+          this.platform.log.warn(
+            `Retrying ${method?.toUpperCase() ?? 'request'} ${error.config?.url}: ${this.formatAxiosError(error)}`);
+        }
 
         return shouldRetry;
       },
@@ -314,7 +327,7 @@ export class BondApi {
   ping(): Promise<any> {
     const uuid = intformat(flakeIdGen.next(), 'hex', { prefix: '18', padstr: '0', size: 16 }); // avoid duplicate action
     const bondUuid = uuid.substring(0, 13) + uuid.substring(15); // remove '00' used for datacenter/worker in flakeIdGen
-    return axios({
+    return this.http({
       method: HTTPMethod.GET,
       url: this.uri.deviceIds(),
       headers: {
@@ -337,7 +350,7 @@ export class BondApi {
     }
 
     return this.acquireRequestSlot()
-      .then(() => axios({
+      .then(() => this.http({
         method,
         url: uri,
         headers: {
@@ -346,6 +359,9 @@ export class BondApi {
         },
         data: body,
         timeout: 10000,
+        'axios-retry': {
+          retries: method === HTTPMethod.GET ? READ_RETRIES : WRITE_RETRIES,
+        },
       }))
       .then(response => {
         this.platform.log.debug(`Response (${bondUuid}) [${method} ${uri}] - ${JSON.stringify(response.data)}`);
@@ -359,12 +375,12 @@ export class BondApi {
               this.platform.log.error('Unauthorized. Please check the `token` in your config to see if it is correct.');
               return;
             default:
-              this.platform.log.error(`A request error occurred: ${this.formatAxiosError(error)}`);
+              this.platform.log.error(`A request error occurred [${method.toUpperCase()} ${uri}]: ${this.formatAxiosError(error)}`);
           }
         } else {
           const code = (error as any).code ?? '';
           const message = (error as any).message ?? 'Unknown error';
-          this.platform.log.error(`A request error occurred: [code] ${code} [message] ${message}`);
+          this.platform.log.error(`A request error occurred [${method.toUpperCase()} ${uri}]: [code] ${code} [message] ${message}`);
         }
       })
       .finally(() => {
