@@ -9,6 +9,7 @@ import { Version } from './interface/Version';
 import axios, { AxiosError, AxiosInstance } from 'axios';
 import axiosRetry from 'axios-retry';
 import FlakeId from 'flake-idgen';
+import http from 'http';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const intformat = require('biguint-format');
 
@@ -57,7 +58,12 @@ export class BondApi {
 
     // Use a dedicated client so retry interceptors don't stack on the global
     // axios instance (one per configured Bond).
-    this.http = axios.create();
+    // Bonds close the TCP connection after each reply. Node 19+ reuses sockets
+    // by default, so a follow-up request could go out on a socket the Bond
+    // already closed (ECONNRESET / "socket hang up"). Use one connection per request.
+    this.http = axios.create({
+      httpAgent: new http.Agent({ keepAlive: false }),
+    });
     axiosRetry(this.http, {
       retries: READ_RETRIES,
       retryDelay: axiosRetry.exponentialDelay,
@@ -255,6 +261,9 @@ export class BondApi {
   public toggleState(device: Device, property: string): Promise<void> {
     return this.getState(device.id)
       .then(state => {
+        if (!state) {
+          throw Error('Could not read the current state from the Bond');
+        }
         if(property !== 'open' && property !== 'power' && property !== 'light' && property !== 'up_light' && property !== 'down_light') {
           throw Error(`This device does not have ${property} in it's Bond state`);
         }

@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import 'mocha';
 import nock from 'nock';
+import http from 'http';
 import net from 'net';
 import sinon from 'sinon';
 import { Action } from '../src/enum/Action';
@@ -384,6 +385,46 @@ describe('BondApi', () => {
 
   describe('toggleState(device, property)', () => {
     const device = DeviceFactory.createDevice({ id: 'fan1' });
+
+    it('rejects with a clear message when the current state cannot be read', async () => {
+      nock(`http://${TEST_IP}`).get('/v2/devices/fan1/state').reply(404, {});
+
+      let error: Error | undefined;
+      await api.toggleState(device, 'light').catch(e => {
+        error = e;
+      });
+      expect(error?.message).to.equal('Could not read the current state from the Bond');
+    });
+
+    it('does not reuse a socket the Bond closed after the GET (no ECONNRESET retry)', async () => {
+      nock.restore(); // talk to a real local server for this test
+      try {
+        // Like a Bond: replies without "Connection: close", then drops the socket.
+        const server = http.createServer((req, res) => {
+          req.resume();
+          req.on('end', () => {
+            const body = req.method === 'GET' ? '{"light":1}' : '{}';
+            res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+            res.end(body);
+            setTimeout(() => req.socket.destroy(), 1);
+          });
+        });
+        server.keepAliveTimeout = 60000;
+        await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()));
+        const { port } = server.address() as net.AddressInfo;
+        const localApi = new BondApi(platform, TEST_TOKEN, `127.0.0.1:${port}`);
+
+        for (let i = 0; i < 10; i++) {
+          await localApi.toggleState(device, 'light');
+        }
+        await new Promise(resolve => server.close(resolve));
+
+        expect((platform as any).log.warn.called).to.be.false;
+        expect((platform as any).log.error.called).to.be.false;
+      } finally {
+        nock.activate();
+      }
+    });
 
     it('GETs current state then PATCHes inverted power (1→0)', async () => {
       nock(`http://${TEST_IP}`)
